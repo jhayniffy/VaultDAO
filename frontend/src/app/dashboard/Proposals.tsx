@@ -63,6 +63,7 @@ const Proposals: React.FC = () => {
   const { address } = useWallet();
   const { isReady, checkReady } = useActionReadiness();
   const { subscribe, updatePresence } = useRealtime();
+  const { subscribe, updatePresence, connectionStatus, trackEvent } = useRealtime();
 
   const {
     proposals,
@@ -127,6 +128,8 @@ const Proposals: React.FC = () => {
 
     const unsubscribers = [
       subscribe('proposal_created', (data: Proposal) => {
+        const eventId = `created-${data.id}`;
+        if (!trackEvent(eventId)) return;
         setLocalProposals((prev) => [data, ...prev]);
         notify('new_proposal', `New proposal #${data.id} created`, 'info');
       }),
@@ -135,10 +138,13 @@ const Proposals: React.FC = () => {
           prev.map((p) => (p.id === data.id ? { ...p, ...data.updates } : p))
         );
       }),
-      subscribe('proposal_approved', (data: { id: string; approver: string }) => {
+      subscribe('proposal_approved', (data: { id: string; approver: string; eventId?: string }) => {
+        const eventId = data.eventId ?? `approved-${data.id}-${data.approver}`;
+        if (!trackEvent(eventId)) return;
         setLocalProposals((prev) =>
           prev.map((p) => {
             if (p.id === data.id) {
+              if (p.approvedBy.includes(data.approver)) return p;
               const newApprovals = p.approvals + 1;
               const newApprovedBy = [...p.approvedBy, data.approver];
               return {
@@ -153,7 +159,9 @@ const Proposals: React.FC = () => {
         );
         notify('proposal_approved', `Proposal #${data.id} approved`, 'success');
       }),
-      subscribe('proposal_rejected', (data: { id: string }) => {
+      subscribe('proposal_rejected', (data: { id: string; eventId?: string }) => {
+        const eventId = data.eventId ?? `rejected-${data.id}`;
+        if (!trackEvent(eventId)) return;
         setLocalProposals((prev) =>
           prev.map((p) => (p.id === data.id ? { ...p, status: 'Rejected' } : p))
         );
@@ -286,6 +294,17 @@ const Proposals: React.FC = () => {
     <div className="min-h-screen bg-gray-900 p-6 text-white">
       <div className="max-w-7xl mx-auto">
         <ReadinessWarning />
+        {connectionStatus === 'connecting' && (
+          <div className="mb-4 flex items-center gap-2 rounded-lg bg-yellow-500/10 border border-yellow-500/30 px-4 py-2 text-sm text-yellow-400">
+            <Loader2 size={14} className="animate-spin" />
+            Reconnecting to realtime updates…
+          </div>
+        )}
+        {connectionStatus === 'error' && (
+          <div className="mb-4 rounded-lg bg-red-500/10 border border-red-500/30 px-4 py-2 text-sm text-red-400">
+            Realtime updates unavailable. Data may be stale.
+          </div>
+        )}
         <div className="flex justify-between items-center mb-8">
           <h1 className="text-3xl font-bold">Proposals</h1>
           <div className="flex items-center gap-3">

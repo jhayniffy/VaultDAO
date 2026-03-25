@@ -60,6 +60,18 @@ const MAX_CROSS_VAULT_ACTIONS: u32 = 5;
 /// Maximum length for a single metadata value
 const MAX_METADATA_VALUE_LEN: u32 = 256;
 
+/// Maximum number of tags per proposal
+const MAX_TAGS: u32 = 10;
+
+/// Maximum number of attachments per proposal
+const MAX_ATTACHMENTS: u32 = 10;
+
+/// Minimum length for an attachment CID (CIDv0 = 46 chars, CIDv1 base32 = 59+ chars)
+const MIN_ATTACHMENT_LEN: u32 = 46;
+
+/// Maximum length for an attachment CID
+const MAX_ATTACHMENT_LEN: u32 = 128;
+
 /// Reputation adjustments
 const REP_EXEC_PROPOSER: u32 = 10;
 const REP_EXEC_APPROVER: u32 = 5;
@@ -330,6 +342,7 @@ impl VaultDAO {
         }
 
         // 4. Validate recipient against lists
+        Self::validate_recipient(&env, &recipient)?;
 
         // 5. Velocity Limit Check (Sliding Window)
         if !storage::check_and_update_velocity(&env, &proposer, &config.velocity_limit) {
@@ -1809,7 +1822,8 @@ impl VaultDAO {
             return Err(VaultError::InvalidAmount);
         }
 
-        // Validate recipient against lists
+        // Validate recipient against whitelist/blacklist policies
+        Self::validate_recipient(&env, &recipient)?;
 
         // Minimum interval check (e.g. 1 hour = 720 ledgers)
         if interval < 720 {
@@ -1873,6 +1887,11 @@ impl VaultDAO {
         if balance < payment.amount {
             return Err(VaultError::InsufficientBalance);
         }
+
+        // Revalidate recipient against current whitelist/blacklist policies.
+        // Policies may have changed since scheduling; block execution if the
+        // recipient is no longer permitted.
+        Self::validate_recipient(&env, &payment.recipient)?;
 
         // Execute
         token::transfer(&env, &payment.token, &payment.recipient, payment.amount);
@@ -2511,12 +2530,17 @@ impl VaultDAO {
             return Err(VaultError::Unauthorized);
         }
 
-        // IPFS CID v0 is 46 chars; reject obviously invalid hashes
-        if attachment.len() < 10 {
-            return Err(VaultError::InvalidAmount);
+        // IPFS CID v0 is 46 chars; CIDv1 base32 is 59+ chars; reject anything
+        // outside the valid range with a dedicated error code.
+        let alen = attachment.len();
+        if !(MIN_ATTACHMENT_LEN..=MAX_ATTACHMENT_LEN).contains(&alen) {
+            return Err(VaultError::AttachmentHashInvalid);
         }
 
         let mut attachments = storage::get_attachments(&env, proposal_id);
+        if attachments.len() >= MAX_ATTACHMENTS {
+            return Err(VaultError::TooManyAttachments);
+        }
         if attachments.contains(attachment.clone()) {
             return Err(VaultError::AlreadyApproved); // duplicate attachment
         }
@@ -2580,7 +2604,7 @@ impl VaultDAO {
         // Metadata validation: non-empty bounded value and bounded entry count.
         let value_len = value.len();
         if value_len == 0 || value_len > MAX_METADATA_VALUE_LEN {
-            return Err(VaultError::InvalidAmount);
+            return Err(VaultError::MetadataValueInvalid);
         }
 
         let exists = proposal.metadata.get(key.clone()).is_some();
@@ -2663,6 +2687,10 @@ impl VaultDAO {
 
         if proposal.tags.contains(&tag) {
             return Err(VaultError::AlreadyApproved); // duplicate tag
+        }
+
+        if proposal.tags.len() >= MAX_TAGS {
+            return Err(VaultError::TooManyTags);
         }
 
         proposal.tags.push_back(tag);

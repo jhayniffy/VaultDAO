@@ -1595,7 +1595,7 @@ fn test_attachment_invalid_hash() {
     );
     let invalid_hash = soroban_sdk::String::from_str(&env, "Qm123");
     let result = client.try_add_attachment(&signer1, &proposal_id, &invalid_hash);
-    assert_eq!(result.err(), Some(Ok(VaultError::InvalidAmount)));
+    assert_eq!(result.err(), Some(Ok(VaultError::AttachmentHashInvalid)));
 }
 
 #[test]
@@ -1910,7 +1910,7 @@ fn test_proposal_metadata_empty_value_invalid() {
     let key = Symbol::new(&env, "category");
     let empty_value = soroban_sdk::String::from_str(&env, "");
     let res = client.try_set_proposal_metadata(&signer1, &proposal_id, &key, &empty_value);
-    assert_eq!(res.err(), Some(Ok(VaultError::InvalidAmount)));
+    assert_eq!(res.err(), Some(Ok(VaultError::MetadataValueInvalid)));
 }
 
 #[test]
@@ -1954,7 +1954,7 @@ fn test_proposal_metadata_value_too_long_invalid() {
     let too_long_std = "a".repeat((MAX_METADATA_VALUE_LEN + 1) as usize);
     let too_long_value = soroban_sdk::String::from_str(&env, too_long_std.as_str());
     let res = client.try_set_proposal_metadata(&signer1, &proposal_id, &key, &too_long_value);
-    assert_eq!(res.err(), Some(Ok(VaultError::InvalidAmount)));
+    assert_eq!(res.err(), Some(Ok(VaultError::MetadataValueInvalid)));
 }
 
 #[test]
@@ -9105,4 +9105,718 @@ fn invariant_executed_proposal_cannot_receive_new_approvals() {
     // s1 was not in the approval list; attempting to approve post-execution must fail
     let res = client.try_approve_proposal(&s1, &pid);
     assert_eq!(res.err(), Some(Ok(VaultError::ProposalNotPending)));
+}
+
+// ============================================================================
+// Recurring Payment Whitelist / Blacklist Enforcement Tests
+// ============================================================================
+
+/// Helper: build a minimal InitConfig for recurring-payment tests.
+fn recurring_init_config(env: &Env, admin: &Address, treasurer: &Address) -> InitConfig {
+    let mut signers = soroban_sdk::Vec::new(env);
+    signers.push_back(admin.clone());
+    signers.push_back(treasurer.clone());
+    InitConfig {
+        signers,
+        threshold: 1,
+        quorum: 0,
+        default_voting_deadline: 0,
+        spending_limit: 10_000,
+        daily_limit: 100_000,
+        weekly_limit: 500_000,
+        timelock_threshold: 50_000,
+        timelock_delay: 100,
+        velocity_limit: VelocityConfig {
+            limit: 1000,
+            window: 3600,
+        },
+        threshold_strategy: ThresholdStrategy::Fixed,
+        veto_addresses: soroban_sdk::Vec::new(env),
+        retry_config: RetryConfig {
+            enabled: false,
+            max_retries: 0,
+            initial_backoff_ledgers: 0,
+        },
+        recovery_config: crate::types::RecoveryConfig::default(env),
+        staking_config: crate::types::StakingConfig::default(),
+    }
+}
+
+/// Scheduling a recurring payment for a whitelisted recipient succeeds when
+/// the vault is in Whitelist mode.
+#[test]
+fn test_recurring_schedule_whitelisted_recipient_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(1000);
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasurer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    client.initialize(&admin, &recurring_init_config(&env, &admin, &treasurer));
+    client.set_role(&admin, &treasurer, &Role::Treasurer);
+
+    // Enable whitelist mode and approve the recipient.
+    client.set_list_mode(&admin, &ListMode::Whitelist);
+    client.add_to_whitelist(&admin, &recipient);
+
+    let result = client.try_schedule_payment(
+        &treasurer,
+        &recipient,
+        &token,
+        &500i128,
+        &Symbol::new(&env, "salary"),
+        &720u64,
+    );
+    assert!(
+        result.is_ok(),
+        "Expected scheduling to succeed for a whitelisted recipient"
+    );
+}
+
+/// Scheduling a recurring payment for a non-whitelisted recipient fails with
+/// RecipientNotWhitelisted when the vault is in Whitelist mode.
+#[test]
+fn test_recurring_schedule_non_whitelisted_recipient_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(1000);
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasurer = Address::generate(&env);
+    let recipient = Address::generate(&env); // NOT added to whitelist
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    client.initialize(&admin, &recurring_init_config(&env, &admin, &treasurer));
+    client.set_role(&admin, &treasurer, &Role::Treasurer);
+
+    client.set_list_mode(&admin, &ListMode::Whitelist);
+    // Deliberately do NOT whitelist the recipient.
+
+    let result = client.try_schedule_payment(
+        &treasurer,
+        &recipient,
+        &token,
+        &500i128,
+        &Symbol::new(&env, "salary"),
+        &720u64,
+    );
+    assert_eq!(
+        result.err(),
+        Some(Ok(VaultError::RecipientNotWhitelisted)),
+        "Expected RecipientNotWhitelisted for a non-whitelisted recipient in whitelist mode"
+    );
+}
+
+/// Scheduling a recurring payment for a blacklisted recipient fails with
+/// RecipientBlacklisted when the vault is in Blacklist mode.
+#[test]
+fn test_recurring_schedule_blacklisted_recipient_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(1000);
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasurer = Address::generate(&env);
+    let blocked = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    client.initialize(&admin, &recurring_init_config(&env, &admin, &treasurer));
+    client.set_role(&admin, &treasurer, &Role::Treasurer);
+
+    client.set_list_mode(&admin, &ListMode::Blacklist);
+    client.add_to_blacklist(&admin, &blocked);
+
+    let result = client.try_schedule_payment(
+        &treasurer,
+        &blocked,
+        &token,
+        &500i128,
+        &Symbol::new(&env, "blocked"),
+        &720u64,
+    );
+    assert_eq!(
+        result.err(),
+        Some(Ok(VaultError::RecipientBlacklisted)),
+        "Expected RecipientBlacklisted for a blacklisted recipient in blacklist mode"
+    );
+}
+
+/// Scheduling a recurring payment for a non-blacklisted recipient succeeds
+/// when the vault is in Blacklist mode.
+#[test]
+fn test_recurring_schedule_non_blacklisted_recipient_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(1000);
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasurer = Address::generate(&env);
+    let allowed = Address::generate(&env); // not on blacklist
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    client.initialize(&admin, &recurring_init_config(&env, &admin, &treasurer));
+    client.set_role(&admin, &treasurer, &Role::Treasurer);
+
+    client.set_list_mode(&admin, &ListMode::Blacklist);
+    // allowed is not blacklisted — scheduling must succeed.
+
+    let result = client.try_schedule_payment(
+        &treasurer,
+        &allowed,
+        &token,
+        &500i128,
+        &Symbol::new(&env, "ok"),
+        &720u64,
+    );
+    assert!(
+        result.is_ok(),
+        "Expected scheduling to succeed for a non-blacklisted recipient in blacklist mode"
+    );
+}
+
+/// Scheduling succeeds when list mode is Disabled regardless of any lists.
+#[test]
+fn test_recurring_schedule_list_disabled_always_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(1000);
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasurer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    client.initialize(&admin, &recurring_init_config(&env, &admin, &treasurer));
+    client.set_role(&admin, &treasurer, &Role::Treasurer);
+
+    // Default mode is Disabled — no restrictions.
+    let result = client.try_schedule_payment(
+        &treasurer,
+        &recipient,
+        &token,
+        &500i128,
+        &Symbol::new(&env, "free"),
+        &720u64,
+    );
+    assert!(
+        result.is_ok(),
+        "Expected scheduling to succeed when list mode is Disabled"
+    );
+}
+
+/// Execution is blocked when the recipient was added to the blacklist after
+/// the payment was scheduled (revalidation at execution time).
+#[test]
+fn test_recurring_execute_blocked_after_blacklisted_post_schedule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(1000);
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasurer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(admin.clone());
+    let token = token_contract.address();
+    let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    token_client.mint(&contract_id, &10_000);
+
+    client.initialize(&admin, &recurring_init_config(&env, &admin, &treasurer));
+    client.set_role(&admin, &treasurer, &Role::Treasurer);
+
+    // Schedule while list mode is Disabled — succeeds.
+    let payment_id = client.schedule_payment(
+        &treasurer,
+        &recipient,
+        &token,
+        &500i128,
+        &Symbol::new(&env, "pay"),
+        &720u64,
+    );
+
+    // Now switch to Blacklist mode and block the recipient.
+    client.set_list_mode(&admin, &ListMode::Blacklist);
+    client.add_to_blacklist(&admin, &recipient);
+
+    // Advance ledger so the payment is due.
+    env.ledger().set_sequence_number(1000 + 720 + 1);
+    env.ledger().set_timestamp(2_000_000);
+
+    let result = client.try_execute_recurring_payment(&payment_id);
+    assert_eq!(
+        result.err(),
+        Some(Ok(VaultError::RecipientBlacklisted)),
+        "Expected RecipientBlacklisted when recipient was blacklisted after scheduling"
+    );
+}
+
+/// Execution is blocked when the recipient is not whitelisted at execution
+/// time, even if the payment was scheduled before whitelist mode was enabled.
+#[test]
+fn test_recurring_execute_blocked_when_whitelist_enabled_post_schedule() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(1000);
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasurer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(admin.clone());
+    let token = token_contract.address();
+    let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    token_client.mint(&contract_id, &10_000);
+
+    client.initialize(&admin, &recurring_init_config(&env, &admin, &treasurer));
+    client.set_role(&admin, &treasurer, &Role::Treasurer);
+
+    // Schedule while list mode is Disabled.
+    let payment_id = client.schedule_payment(
+        &treasurer,
+        &recipient,
+        &token,
+        &500i128,
+        &Symbol::new(&env, "pay"),
+        &720u64,
+    );
+
+    // Enable whitelist mode WITHOUT adding the recipient.
+    client.set_list_mode(&admin, &ListMode::Whitelist);
+
+    env.ledger().set_sequence_number(1000 + 720 + 1);
+    env.ledger().set_timestamp(2_000_000);
+
+    let result = client.try_execute_recurring_payment(&payment_id);
+    assert_eq!(
+        result.err(),
+        Some(Ok(VaultError::RecipientNotWhitelisted)),
+        "Expected RecipientNotWhitelisted when whitelist mode was enabled after scheduling"
+    );
+}
+
+/// Execution succeeds when the recipient is whitelisted at execution time.
+#[test]
+fn test_recurring_execute_succeeds_for_whitelisted_recipient() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(1000);
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasurer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(admin.clone());
+    let token = token_contract.address();
+    let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    token_client.mint(&contract_id, &10_000);
+
+    client.initialize(&admin, &recurring_init_config(&env, &admin, &treasurer));
+    client.set_role(&admin, &treasurer, &Role::Treasurer);
+
+    // Whitelist mode active; recipient is approved.
+    client.set_list_mode(&admin, &ListMode::Whitelist);
+    client.add_to_whitelist(&admin, &recipient);
+
+    let payment_id = client.schedule_payment(
+        &treasurer,
+        &recipient,
+        &token,
+        &500i128,
+        &Symbol::new(&env, "pay"),
+        &720u64,
+    );
+
+    env.ledger().set_sequence_number(1000 + 720 + 1);
+    env.ledger().set_timestamp(2_000_000);
+
+    let result = client.try_execute_recurring_payment(&payment_id);
+    assert!(
+        result.is_ok(),
+        "Expected execution to succeed for a whitelisted recipient"
+    );
+}
+
+/// Execution succeeds when the recipient is not blacklisted at execution time.
+#[test]
+fn test_recurring_execute_succeeds_for_non_blacklisted_recipient() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(1000);
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasurer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(admin.clone());
+    let token = token_contract.address();
+    let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    token_client.mint(&contract_id, &10_000);
+
+    client.initialize(&admin, &recurring_init_config(&env, &admin, &treasurer));
+    client.set_role(&admin, &treasurer, &Role::Treasurer);
+
+    client.set_list_mode(&admin, &ListMode::Blacklist);
+    // recipient is NOT on the blacklist.
+
+    let payment_id = client.schedule_payment(
+        &treasurer,
+        &recipient,
+        &token,
+        &500i128,
+        &Symbol::new(&env, "pay"),
+        &720u64,
+    );
+
+    env.ledger().set_sequence_number(1000 + 720 + 1);
+    env.ledger().set_timestamp(2_000_000);
+
+    let result = client.try_execute_recurring_payment(&payment_id);
+    assert!(
+        result.is_ok(),
+        "Expected execution to succeed for a non-blacklisted recipient"
+    );
+}
+
+/// Removing a recipient from the blacklist re-enables execution.
+#[test]
+fn test_recurring_execute_succeeds_after_removing_from_blacklist() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(1000);
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasurer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract_v2(admin.clone());
+    let token = token_contract.address();
+    let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    token_client.mint(&contract_id, &10_000);
+
+    client.initialize(&admin, &recurring_init_config(&env, &admin, &treasurer));
+    client.set_role(&admin, &treasurer, &Role::Treasurer);
+
+    // Schedule while Disabled.
+    let payment_id = client.schedule_payment(
+        &treasurer,
+        &recipient,
+        &token,
+        &500i128,
+        &Symbol::new(&env, "pay"),
+        &720u64,
+    );
+
+    // Blacklist the recipient — execution should fail.
+    client.set_list_mode(&admin, &ListMode::Blacklist);
+    client.add_to_blacklist(&admin, &recipient);
+
+    env.ledger().set_sequence_number(1000 + 720 + 1);
+    env.ledger().set_timestamp(2_000_000);
+
+    let blocked = client.try_execute_recurring_payment(&payment_id);
+    assert_eq!(
+        blocked.err(),
+        Some(Ok(VaultError::RecipientBlacklisted)),
+        "Execution must be blocked while recipient is blacklisted"
+    );
+
+    // Remove from blacklist — execution should now succeed.
+    client.remove_from_blacklist(&admin, &recipient);
+
+    // Advance past the (unchanged) next_payment_ledger — it was not updated
+    // because the previous execution failed, so the same ledger is still due.
+    let result = client.try_execute_recurring_payment(&payment_id);
+    assert!(
+        result.is_ok(),
+        "Expected execution to succeed after removing recipient from blacklist"
+    );
+}
+
+// ============================================================================
+// Stronger Input Validation — Metadata, Tags, Attachments (#291)
+// ============================================================================
+
+/// Helper: create a proposal and return its ID.
+fn make_proposal(client: &VaultDAOClient, proposer: &Address, recipient: &Address, token: &Address, env: &Env) -> u64 {
+    client.propose_transfer(
+        proposer,
+        recipient,
+        token,
+        &100i128,
+        &Symbol::new(env, "memo"),
+        &Priority::Normal,
+        &soroban_sdk::Vec::new(env),
+        &ConditionLogic::And,
+        &0i128,
+    )
+}
+
+// --- Attachment validation ---
+
+/// A valid CIDv0 hash (46 chars) is accepted.
+#[test]
+fn test_attachment_valid_cidv0_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&contract_id, &1000);
+    let mut signers = soroban_sdk::Vec::new(&env);
+    signers.push_back(admin.clone());
+    client.initialize(&admin, &default_init_config(&env, signers, 1));
+    let pid = make_proposal(&client, &admin, &recipient, &token, &env);
+    // CIDv0 is exactly 46 chars starting with "Qm"
+    let cid = String::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
+    let res = client.try_add_attachment(&admin, &pid, &cid);
+    assert!(res.is_ok(), "Valid CIDv0 should be accepted");
+}
+
+/// A hash shorter than 46 chars is rejected with AttachmentHashInvalid.
+#[test]
+fn test_attachment_too_short_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&contract_id, &1000);
+    let mut signers = soroban_sdk::Vec::new(&env);
+    signers.push_back(admin.clone());
+    client.initialize(&admin, &default_init_config(&env, signers, 1));
+    let pid = make_proposal(&client, &admin, &recipient, &token, &env);
+    let short = String::from_str(&env, "tooshort");
+    let res = client.try_add_attachment(&admin, &pid, &short);
+    assert_eq!(res.err(), Some(Ok(VaultError::AttachmentHashInvalid)));
+}
+
+/// A hash longer than 128 chars is rejected with AttachmentHashInvalid.
+#[test]
+fn test_attachment_too_long_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&contract_id, &1000);
+    let mut signers = soroban_sdk::Vec::new(&env);
+    signers.push_back(admin.clone());
+    client.initialize(&admin, &default_init_config(&env, signers, 1));
+    let pid = make_proposal(&client, &admin, &recipient, &token, &env);
+    // 129 chars
+    let long = String::from_str(&env, "Qmaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let res = client.try_add_attachment(&admin, &pid, &long);
+    assert_eq!(res.err(), Some(Ok(VaultError::AttachmentHashInvalid)));
+}
+
+/// Adding more than MAX_ATTACHMENTS (10) attachments is rejected with TooManyAttachments.
+#[test]
+fn test_attachment_max_count_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&contract_id, &1000);
+    let mut signers = soroban_sdk::Vec::new(&env);
+    signers.push_back(admin.clone());
+    client.initialize(&admin, &default_init_config(&env, signers, 1));
+    let pid = make_proposal(&client, &admin, &recipient, &token, &env);
+
+    // CIDv0 hashes — each unique, exactly 46 chars
+    let cids = [
+        "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG",
+        "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdH",
+        "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdI",
+        "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdJ",
+        "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdK",
+        "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdL",
+        "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdM",
+        "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdN",
+        "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdO",
+        "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdP",
+    ];
+    for cid in &cids {
+        client.add_attachment(&admin, &pid, &String::from_str(&env, cid));
+    }
+
+    // 11th attachment must be rejected
+    let extra = String::from_str(&env, "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdQ");
+    let res = client.try_add_attachment(&admin, &pid, &extra);
+    assert_eq!(res.err(), Some(Ok(VaultError::TooManyAttachments)));
+}
+
+// --- Tag validation ---
+
+/// Adding more than MAX_TAGS (10) tags is rejected with TooManyTags.
+#[test]
+fn test_tag_max_count_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&contract_id, &1000);
+    let mut signers = soroban_sdk::Vec::new(&env);
+    signers.push_back(admin.clone());
+    client.initialize(&admin, &default_init_config(&env, signers, 1));
+    let pid = make_proposal(&client, &admin, &recipient, &token, &env);
+
+    let tag_names = ["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10"];
+    for name in &tag_names {
+        client.add_proposal_tag(&admin, &pid, &Symbol::new(&env, name));
+    }
+
+    // 11th tag must be rejected
+    let res = client.try_add_proposal_tag(&admin, &pid, &Symbol::new(&env, "t11"));
+    assert_eq!(res.err(), Some(Ok(VaultError::TooManyTags)));
+}
+
+/// Adding up to MAX_TAGS tags succeeds.
+#[test]
+fn test_tag_up_to_max_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&contract_id, &1000);
+    let mut signers = soroban_sdk::Vec::new(&env);
+    signers.push_back(admin.clone());
+    client.initialize(&admin, &default_init_config(&env, signers, 1));
+    let pid = make_proposal(&client, &admin, &recipient, &token, &env);
+
+    let tag_names = ["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10"];
+    for name in &tag_names {
+        let res = client.try_add_proposal_tag(&admin, &pid, &Symbol::new(&env, name));
+        assert!(res.is_ok(), "Adding tag {} should succeed", name);
+    }
+    assert_eq!(client.get_proposal_tags(&pid).unwrap().len(), 10);
+}
+
+// --- Metadata validation ---
+
+/// An empty metadata value is rejected with MetadataValueInvalid.
+#[test]
+fn test_metadata_empty_value_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&contract_id, &1000);
+    let mut signers = soroban_sdk::Vec::new(&env);
+    signers.push_back(admin.clone());
+    client.initialize(&admin, &default_init_config(&env, signers, 1));
+    let pid = make_proposal(&client, &admin, &recipient, &token, &env);
+    let res = client.try_set_proposal_metadata(
+        &admin, &pid, &Symbol::new(&env, "key"), &String::from_str(&env, ""),
+    );
+    assert_eq!(res.err(), Some(Ok(VaultError::MetadataValueInvalid)));
+}
+
+/// A metadata value exceeding 256 chars is rejected with MetadataValueInvalid.
+#[test]
+fn test_metadata_value_too_long_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&contract_id, &1000);
+    let mut signers = soroban_sdk::Vec::new(&env);
+    signers.push_back(admin.clone());
+    client.initialize(&admin, &default_init_config(&env, signers, 1));
+    let pid = make_proposal(&client, &admin, &recipient, &token, &env);
+    // 257 'a' characters
+    let long_val = String::from_str(&env, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let res = client.try_set_proposal_metadata(
+        &admin, &pid, &Symbol::new(&env, "key"), &long_val,
+    );
+    assert_eq!(res.err(), Some(Ok(VaultError::MetadataValueInvalid)));
+}
+
+/// A valid metadata value (1–256 chars) is accepted.
+#[test]
+fn test_metadata_valid_value_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(VaultDAO, ());
+    let client = VaultDAOClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&contract_id, &1000);
+    let mut signers = soroban_sdk::Vec::new(&env);
+    signers.push_back(admin.clone());
+    client.initialize(&admin, &default_init_config(&env, signers, 1));
+    let pid = make_proposal(&client, &admin, &recipient, &token, &env);
+    let res = client.try_set_proposal_metadata(
+        &admin, &pid, &Symbol::new(&env, "key"), &String::from_str(&env, "valid"),
+    );
+    assert!(res.is_ok(), "Valid metadata value should be accepted");
 }
